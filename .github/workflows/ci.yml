@@ -1,0 +1,266 @@
+name: ci
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'stage'
+        type: choice
+        default: 'all'
+        options: [ 'all', '1', '2' ]
+
+env:
+  B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+  B2_BUCKET: ${{ secrets.B2_BUCKET }}
+  REDROID_IMG: redroid/redroid:9.0.0-latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: a
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip unzip wget openjdk-17-jdk-headless docker.io containerd runc
+          sudo pip3 install --break-system-packages -q frida==17.13.0 frida-tools==14.0.0 b2sdk==2.12.0
+          frida --version
+          mkdir -p $HOME/ghidra
+          cd $HOME/ghidra
+          GHIDRA_VER=11.3.2
+          GHIDRA_DATE=20240909
+          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VER}_build/ghidra_${GHIDRA_VER}_PUBLIC_${GHIDRA_DATE}.zip -O g.zip
+          unzip -q g.zip
+          rm g.zip
+          echo "GHIDRA_HOME=$HOME/ghidra/ghidra_${GHIDRA_VER}_PUBLIC" >> $GITHUB_ENV
+          echo "DONE setup"
+
+      - name: b
+        run: |
+          set -e
+          sudo modprobe binder_linux 2>/dev/null || true
+          sudo modprobe ashmem_linux 2>/dev/null || true
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binderfs /dev/binderfs 2>/dev/null || true
+          if ! ls /dev/binderfs/* 2>/dev/null | head -1 > /dev/null; then
+            echo "binderfs not auto-mounted; trying ashmem path"
+            sudo mknod /dev/ashmem c 10 54 2>/dev/null || true
+            sudo chmod 0666 /dev/ashmem 2>/dev/null || true
+          fi
+          ls -la /dev/binderfs/ 2>&1 | head -10 || true
+          ls -la /dev/ashmem 2>&1 || true
+          sudo docker pull $REDROID_IMG 2>&1 | tail -5
+          echo "DONE kernel+image"
+
+      - name: c
+        run: |
+          set -e
+          sudo docker rm -f r1 2>/dev/null || true
+          sudo docker run -d --name r1 --privileged \
+            -p 5555:5555 \
+            -v /tmp/redroid-data:/data \
+            $REDROID_IMG \
+            androidboot.redroid_gpu_mode=swiftshader \
+            androidboot.redroid_width=720 \
+            androidboot.redroid_height=1280 \
+            androidboot.redroid_dalvik_memory_limit=2048 \
+            androidboot.redroid_sysprop=ro.product.model=G011A \
+            androidboot.redroid_sysprop=ro.product.brand=google \
+            androidboot.redroid_sysprop=ro.product.name=google \
+            androidboot.redroid_sysprop=ro.product.device=G011A \
+            androidboot.redroid_sysprop=ro.product.manufacturer=Google \
+            androidboot.redroid_sysprop=ro.build.id=mv-dev1030410 \
+            androidboot.redroid_sysprop=ro.build.tags=release-keys \
+            androidboot.redroid_sysprop=ro.build.type=user \
+            androidboot.redroid_sysprop=ro.build.version.release=9 \
+            androidboot.redroid_sysprop=ro.build.version.sdk=28 \
+            androidboot.redroid_sysprop=ro.build.fingerprint=google/google/G011A:9/mv-dev1030410/42:user/release-keys \
+            androidboot.redroid_sysprop=ro.bootimage.build.fingerprint=google/google/G011A:9/mv-dev1030410/42:user/release-keys \
+            androidboot.redroid_sysprop=ro.vendor.build.fingerprint=google/google/G011A:9/mv-dev1030410/42:user/release-keys \
+            androidboot.redroid_sysprop=ro.boot.fingerprint=google/google/G011A:9/mv-dev1030410/42:user/release-keys \
+            androidboot.redroid_sysprop=ro.boot.hardware=G011A \
+            androidboot.redroid_sysprop=ro.hardware=G011A \
+            androidboot.redroid_sysprop=ro.product.cpu.abi=x86_64 \
+            androidboot.redroid_sysprop=ro.product.cpu.abilist=x86_64,x86,arm64-v8a,armeabi-v7a,armeabi
+          sleep 5
+          sudo docker ps | grep r1
+          echo "DONE container-start"
+
+      - name: d
+        run: |
+          set -e
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH=$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin
+          adb start-server
+          adb connect localhost:5555
+          for i in $(seq 1 90); do
+            B=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$B" = "1" ]; then echo "BOOT OK after ${i}*5s"; break; fi
+            sleep 5
+          done
+          B=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+          if [ "$B" != "1" ]; then echo "BOOT TIMEOUT"; sudo docker logs r1 | tail -100; exit 1; fi
+          adb -s localhost:5555 root 2>&1 | head -3 || true
+          sleep 2
+          adb -s localhost:5555 shell 'settings put global auto_time 0; settings put global auto_time_zone 0; date 092512002025.00; date +%s'
+          echo "ACTUAL fingerprint:"; adb -s localhost:5555 shell getprop ro.build.fingerprint
+          echo "ACTUAL api:"; adb -s localhost:5555 shell getprop ro.build.version.sdk
+          echo "ACTUAL model:"; adb -s localhost:5555 shell getprop ro.product.model
+          echo "ACTUAL time:"; adb -s localhost:5555 shell date
+          echo "DONE boot"
+
+      - name: e
+        run: |
+          set -e
+          wget -q -O /tmp/pfs.gz https://github.com/michelledupuis/phantom-frida/releases/download/v17.13.0-android-x86_64-20260617/system_helper681-server-17.13.0-android-x86_64.gz
+          gunzip -f /tmp/pfs.gz
+          PFS=/tmp/system_helper681-server-17.13.0-android-x86_64
+          ls -la $PFS
+          adb -s localhost:5555 push $PFS /data/local/tmp/pfs
+          adb -s localhost:5555 shell 'chmod 0755 /data/local/tmp/pfs'
+          adb -s localhost:5555 shell 'nohup /data/local/tmp/pfs -l info >/data/local/tmp/pfs.log 2>&1 < /dev/null &'
+          sleep 5
+          adb -s localhost:5555 forward tcp:37194 tcp:37194
+          echo "=== pfs.log ==="
+          adb -s localhost:5555 shell 'cat /data/local/tmp/pfs.log' | head -30
+          echo "=== frida-ps ==="
+          frida-ps -H 127.0.0.1:37194 2>&1 | head -10 || (echo "frida-ps failed"; adb -s localhost:5555 shell 'cat /data/local/tmp/pfs.log'; exit 1)
+          echo "DONE phantom"
+
+      - name: f
+        run: |
+          set -e
+          mkdir -p /tmp/apk
+          python3 b.py get com.app.ecobank_4.5.1_x86_64.apks /tmp/apk/app.apks
+          cd /tmp/apk
+          unzip -o app.apks -d extracted
+          echo "=== contents of .apks ==="
+          ls -la extracted/ | head -30
+          echo "DONE apk-fetch"
+
+      - name: g
+        run: |
+          set -e
+          APKS_DIR=/tmp/apk/extracted
+          APK_BASE=$(ls $APKS_DIR/base.apk $APKS_DIR/base-*.apk 2>/dev/null | head -1)
+          if [ -z "$APK_BASE" ]; then echo "no base.apk"; exit 1; fi
+          ALL_APKS="$APK_BASE"
+          for f in $APKS_DIR/config.x86_64.apk $APKS_DIR/config.en.apk $APKS_DIR/config.xxhdpi.apk $APKS_DIR/config.mdpi.apk $APKS_DIR/config.nodpi.apk; do
+            [ -f "$f" ] && ALL_APKS="$ALL_APKS $f"
+          done
+          echo "Installing: $ALL_APKS"
+          adb -s localhost:5555 install -r -t -d $ALL_APKS 2>&1 | tail -10
+          echo "=== verify install ==="
+          adb -s localhost:5555 shell pm list packages | grep ecobank
+          adb -s localhost:5555 shell dumpsys package com.app.ecobank | grep -E "versionName|targetSdk|primaryCpuAbi" | head -5
+          echo "DONE install"
+
+      - name: h
+        run: |
+          set -e
+          PKG=com.app.ecobank
+          APP_UID=$(adb -s localhost:5555 shell 'stat -c %u /data/data/'$PKG 2>/dev/null | tr -d '\r')
+          echo "APP_UID=$APP_UID"
+          adb -s localhost:5555 shell "mkdir -p /data/data/$PKG/files/dp_dumps"
+          adb -s localhost:5555 shell "chown -R $APP_UID:$APP_UID /data/data/$PKG/files"
+          adb -s localhost:5555 shell "chmod -R 0750 /data/data/$PKG/files"
+          adb -s localhost:5555 shell "ls -la /data/data/$PKG/files/"
+          echo "DONE prep-dumpdir"
+
+      - name: i
+        run: |
+          set -e
+          mkdir -p /tmp/run
+          cd /tmp/run
+          cp $GITHUB_WORKSPACE/s1.js .
+          echo "=== launching frida stage1 ==="
+          set +e
+          timeout 180 frida -H 127.0.0.1:37194 -f com.app.ecobank -l s1.js -o s1.log --runtime=v8 --no-pause 2>&1 | tee s1.console.log
+          EC=$?
+          set -e
+          echo "frida exit=$EC"
+          echo "=== dp_dumps dir listing ==="
+          adb -s localhost:5555 shell 'ls -la /data/data/com.app.ecobank/files/dp_dumps/' 2>&1 | tee dp_dumps.listing
+          adb -s localhost:5555 shell 'tar -C /data/data/com.app.ecobank/files -cf - dp_dumps 2>/dev/null' > dp_dumps.tar || true
+          ls -la /tmp/run/
+          echo "DONE stage1"
+
+      - name: j
+        if: always()
+        run: |
+          set +e
+          cd /tmp/run
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          RUN_DIR=runs/x86_64_v4/$TS
+          python3 $GITHUB_WORKSPACE/b.py put s1.log $RUN_DIR/s1.log
+          python3 $GITHUB_WORKSPACE/b.py put s1.console.log $RUN_DIR/s1.console.log
+          python3 $GITHUB_WORKSPACE/b.py put dp_dumps.listing $RUN_DIR/dp_dumps.listing
+          if [ -s dp_dumps.tar ]; then
+            python3 $GITHUB_WORKSPACE/b.py put dp_dumps.tar $RUN_DIR/dp_dumps.tar
+          fi
+          adb -s localhost:5555 shell 'getprop ro.build.fingerprint' > fingerprint.txt
+          adb -s localhost:5555 shell 'getprop ro.build.version.sdk' > sdk.txt
+          adb -s localhost:5555 shell 'getprop ro.product.cpu.abi' > abi.txt
+          python3 $GITHUB_WORKSPACE/b.py put fingerprint.txt $RUN_DIR/fingerprint.txt
+          python3 $GITHUB_WORKSPACE/b.py put sdk.txt $RUN_DIR/sdk.txt
+          python3 $GITHUB_WORKSPACE/b.py put abi.txt $RUN_DIR/abi.txt
+          echo "RUN_DIR=$RUN_DIR" >> $GITHUB_ENV
+          echo "DONE upload-stage1-logs"
+
+      - name: k
+        continue-on-error: true
+        run: |
+          set -e
+          cd /tmp/run
+          mkdir -p dumps
+          if [ -s dp_dumps.tar ]; then
+            tar -xf dp_dumps.tar -C dumps
+            echo "=== dumps dir ==="
+            ls -la dumps/dp_dumps/ 2>/dev/null | head -20
+            HIDDEN=$(find dumps -name 'anon_rwx_*' -size +200k 2>/dev/null | head -1)
+            if [ -z "$HIDDEN" ]; then HIDDEN=$(find dumps -name 'hidden_image*' -size +200k 2>/dev/null | head -1); fi
+            if [ -z "$HIDDEN" ]; then HIDDEN=$(find dumps -type f -size +200k 2>/dev/null | head -1); fi
+            if [ -n "$HIDDEN" ]; then
+              echo "Hidden image candidate: $HIDDEN  ($(stat -c %s $HIDDEN) bytes)"
+              cp "$HIDDEN" /tmp/run/hidden_image.bin
+              export RVA_OUT=/tmp/run/rvas.json
+              $GHIDRA_HOME/support/analyzeHeadless /tmp/ghidra_proj proj1 \
+                -import /tmp/run/hidden_image.bin \
+                -postScript $GITHUB_WORKSPACE/r.py \
+                -scriptPath $GITHUB_WORKSPACE \
+                -deleteProject 2>&1 | tail -40
+              if [ -s /tmp/run/rvas.json ]; then
+                python3 $GITHUB_WORKSPACE/b.py put /tmp/run/rvas.json $RUN_DIR/rvas.json
+              fi
+              python3 $GITHUB_WORKSPACE/b.py put /tmp/run/hidden_image.bin $RUN_DIR/hidden_image.bin
+              echo "DONE ghidra"
+            else
+              echo "NO hidden image found in dumps (Stage 1 may have failed)"
+            fi
+          else
+            echo "NO dp_dumps.tar produced (Stage 1 failed before dump)"
+          fi
+
+      - name: l
+        if: always()
+        run: |
+          cd /tmp/run
+          ls -la
+          echo "=== s1.log tail ==="
+          tail -100 s1.log 2>/dev/null || echo "no s1.log"
+          echo "=== s1.console.log tail ==="
+          tail -50 s1.console.log 2>/dev/null || echo "no console log"
+          echo "=== dp_dumps.listing ==="
+          cat dp_dumps.listing 2>/dev/null || echo "no listing"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: run-artifacts
+          path: /tmp/run/
+          retention-days: 7
