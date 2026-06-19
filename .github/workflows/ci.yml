@@ -32,9 +32,10 @@ jobs:
           frida --version
           mkdir -p $HOME/ghidra
           cd $HOME/ghidra
-          GHIDRA_VER=11.3.2
-          GHIDRA_DATE=20240909
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VER}_build/ghidra_${GHIDRA_VER}_PUBLIC_${GHIDRA_DATE}.zip -O g.zip
+          GHIDRA_VER=12.1.2
+          GHIDRA_DATE=20260605
+          wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VER}_build/ghidra_${GHIDRA_VER}_PUBLIC_${GHIDRA_DATE}.zip" -O g.zip
+          ls -la g.zip
           unzip -q g.zip
           rm g.zip
           echo "GHIDRA_HOME=$HOME/ghidra/ghidra_${GHIDRA_VER}_PUBLIC" >> $GITHUB_ENV
